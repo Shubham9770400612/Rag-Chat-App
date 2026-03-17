@@ -1,6 +1,5 @@
 import streamlit as st
 import os
-import json
 from dotenv import load_dotenv
 from PyPDF2 import PdfReader
 
@@ -13,52 +12,32 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
 
+# ❌ removed old memory import
+
 # 1. LOAD ENV & PATHS
 load_dotenv()
 LLM_MODEL = os.getenv("LLM_MODEL", "llama3.2:3b")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "nomic-embed-text")
 INDEX_PATH = os.getenv("INDEX_PATH", "faiss_index")
 PDF_STORAGE_PATH = os.getenv("PDF_STORAGE_PATH", "uploaded_pdfs")
-CHAT_FILE = "chat_history.json"  # ✅ file storage
 
 for path in [PDF_STORAGE_PATH, INDEX_PATH]:
     if not os.path.exists(path):
         os.makedirs(path)
 
 st.set_page_config(page_title="Enterprise RAG v2", layout="wide")
-st.title("🛡️ Local PDF Intelligence (Chat Mode + Memory)")
+st.title("🛡️ Local PDF Intelligence (Chat Mode)")
 
-# -------------------------------
-# ✅ CHAT LOAD & SAVE FUNCTIONS
-# -------------------------------
-def load_chat():
-    if os.path.exists(CHAT_FILE):
-        with open(CHAT_FILE, "r") as f:
-            return json.load(f)
-    return []
-
-def save_chat(history):
-    with open(CHAT_FILE, "w") as f:
-        json.dump(history, f)
-
-# -------------------------------
 # ✅ INIT CHAT HISTORY
-# -------------------------------
-if "history" not in st.session_state:
-    st.session_state.history = load_chat()  # load from file
+st.session_state.setdefault("history", [])  # ensure history exists
 
-# -------------------------------
-# ✅ FORMAT HISTORY FOR PROMPT
-# -------------------------------
+# ✅ FUNCTION TO FORMAT HISTORY
+
 def format_history():
-    history = st.session_state.get("history", [])
-    
-    cleaned = []
-    for msg in history:
-        text = msg["content"].replace("Hello Shubham, Nice to meet you", "")
-        cleaned.append(f"{msg['role']}: {text}")
-    
-    return "\n".join(cleaned)
+    history = st.session_state.get("history", [])  # safe read
+    return "\n".join(
+        [f"{msg['role']}: {msg['content']}" for msg in history]
+    )
 
 # 2. MODELS (CACHED)
 @st.cache_resource
@@ -88,12 +67,10 @@ def process_pdfs(pdf_files):
             if text:
                 all_docs.append(Document(page_content=text, metadata={"source": pdf.name, "page": i + 1}))
     
-    if not all_docs:
-        return "No text found."
-
+    if not all_docs: return "No text found."
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
     final_chunks = text_splitter.split_documents(all_docs)
-
+    
     vdb = FAISS.from_documents(final_chunks, embeddings)
     vdb.save_local(INDEX_PATH)
     return "Database Synchronized!"
@@ -101,27 +78,19 @@ def process_pdfs(pdf_files):
 # 4. SIDEBAR UI
 with st.sidebar:
     st.header("Control Panel")
-
-    # ✅ clear chat button
-    if st.button("🗑️ Clear Chat"):
-        st.session_state.history = []
-        save_chat([])
-        st.rerun()
-
     uploaded_files = st.file_uploader("Upload PDFs", type="pdf", accept_multiple_files=True)
-
     if st.button("🚀 Sync Knowledge Base"):
         if uploaded_files:
             with st.spinner("Processing..."):
                 st.toast(process_pdfs(uploaded_files))
             st.rerun()
 
-# 5. CHAT INTERFACE
+# 5. CHAT INTERFACE (MULTI-TURN WITH MEMORY)
 retriever = get_retriever()
 
 if retriever:
 
-    # ✅ SHOW OLD CHAT
+    # ✅ DISPLAY OLD CHAT
     for msg in st.session_state.history:
         st.chat_message(msg["role"]).markdown(msg["content"])
 
@@ -129,13 +98,11 @@ if retriever:
 
         # ✅ SAVE USER MESSAGE
         st.session_state.history.append({"role": "user", "content": query})
-        save_chat(st.session_state.history)
-
         st.chat_message("user").markdown(query)
 
         with st.chat_message("assistant"):
 
-            # A. RETRIEVE CONTEXT
+            # A. Retrieve Context
             context_docs = retriever.invoke(query)
             context_text = "\n\n".join(
                 [f"Source: {d.metadata['source']} (P.{d.metadata['page']})\n{d.page_content}" for d in context_docs]
@@ -143,29 +110,24 @@ if retriever:
 
             # B. PROMPT WITH HISTORY
             prompt = ChatPromptTemplate.from_template("""
-                You are a helpful assistant.
+            You are a helpful assistant.
 
-                Rules:
-                - Do NOT greet the user repeatedly
-                - Do NOT say "Hello" or "Nice to meet you" unless user greets first
-                - Give direct, concise answers
+            Chat History:
+            {history}
 
-                Chat History:
-                {history}
+            Context:
+            {context}
 
-                Context:
-                {context}
-
-                Question:
-                {question}
+            Question:
+            {question}
             """)
 
-            # C. CHAIN WITH MEMORY
+            # C. CREATE CHAIN (with history)
             chain = (
                 {
                     "context": lambda _: context_text,
                     "question": RunnablePassthrough(),
-                    "history": lambda _: format_history(),
+                    "history": lambda _: format_history(),  # inject memory
                 }
                 | prompt
                 | llm
@@ -184,12 +146,6 @@ if retriever:
 
             # ✅ SAVE ASSISTANT RESPONSE
             st.session_state.history.append({"role": "assistant", "content": full_response})
-
-            # ✅ LIMIT HISTORY SIZE
-            MAX_HISTORY = 20
-            st.session_state.history = st.session_state.history[-MAX_HISTORY:]
-
-            save_chat(st.session_state.history)
 
             # E. SHOW CITATIONS
             with st.expander("🔍 Citations"):
